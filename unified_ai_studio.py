@@ -4,12 +4,12 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import io
 import gc
+import json
 import time
 import uuid
 import base64
 import asyncio
 import inspect
-import tempfile
 import traceback
 from typing import Optional, Dict, Any, Tuple, List, Union
 
@@ -17,7 +17,8 @@ import torch
 import numpy as np
 import imageio
 from PIL import Image, ImageOps
-from fastapi import FastAPI, HTTPException, Request, UploadFile
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
+from fastapi.responses import StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
@@ -96,12 +97,12 @@ class VideoGenerationRequest(BaseModel):
     prompt: str
     model: Optional[str] = None
     size: Optional[str] = "1280x704"
-    frames: Optional[int] = 81
+    frames: Optional[int] = 49
     fps: Optional[int] = 24
     response_format: Optional[str] = "b64_json"
     negative_prompt: Optional[str] = None
     guidance_scale: Optional[float] = 6.0
-    num_inference_steps: Optional[int] = 30
+    num_inference_steps: Optional[int] = 20
     seed: Optional[int] = None
 
 
@@ -156,6 +157,26 @@ def decode_base64_image(value: str, mode: str = "RGB") -> Image.Image:
         raise HTTPException(status_code=400, detail=f"Could not decode base64 image: {exc}")
 
 
+def load_any_image(img_input: Any) -> Image.Image:
+    """Loads an image regardless of whether it's Base64, a URL, or a local file path."""
+    str_input = str(img_input).strip()
+
+    # Base64 string
+    if str_input.startswith("data:") or len(str_input) > 500:
+        return decode_base64_image(str_input)
+    
+    # HTTP / HTTPS URL
+    if str_input.startswith("http://") or str_input.startswith("https://"):
+        return load_image(str_input).convert("RGB")
+    
+    # Local disk file path
+    if os.path.exists(str_input):
+        return Image.open(str_input).convert("RGB")
+
+    # Fallback to base64 decode attempt
+    return decode_base64_image(str_input)
+
+
 def prepare_image(img: Image.Image, size: Tuple[int, int], mode: str = "RGB") -> Image.Image:
     return ImageOps.exif_transpose(img).convert(mode).resize(size, Image.LANCZOS)
 
@@ -207,13 +228,27 @@ def extract_prompt_and_image_from_chat(messages: List[ChatMessage]) -> Tuple[str
                 text_parts = []
                 for item in msg.content:
                     if isinstance(item, dict):
+                        # Extract prompt text
                         if item.get("type") == "text":
                             text_parts.append(item.get("text", ""))
+                        
+                        # Flexible image_url parsing for various OpenAI spec implementations
                         elif item.get("type") == "image_url":
-                            img_obj = item.get("image_url", {})
-                            init_image = img_obj.get("url") if isinstance(img_obj, dict) else img_obj
+                            img_obj = item.get("image_url")
+                            if isinstance(img_obj, dict):
+                                init_image = img_obj.get("url") or img_obj.get("path")
+                            elif isinstance(img_obj, str):
+                                init_image = img_obj
+                        
+                        elif "image_url" in item:
+                            init_image = item["image_url"]
+                        elif "url" in item:
+                            init_image = item["url"]
+
                 prompt_text = " ".join(text_parts)
-            break
+
+            if prompt_text or init_image:
+                break
 
     return prompt_text.strip(), init_image
 
@@ -232,17 +267,23 @@ def run_pipeline_safely(pipe, kwargs: Dict[str, Any]):
 
 
 def process_video_export(result_frames, fps: int) -> str:
-    """Robust video export function using imageio directly to prevent OpenCV errors."""
     output_filename = os.path.abspath(os.path.join(OUTPUT_DIR, f"{uuid.uuid4()}.mp4"))
     
     formatted_frames = []
     for frame in result_frames:
         if isinstance(frame, Image.Image):
-            formatted_frames.append(np.array(frame))
+            formatted_frames.append(np.array(frame, dtype=np.uint8))
         elif isinstance(frame, torch.Tensor):
-            formatted_frames.append((frame.cpu().numpy() * 255).astype(np.uint8))
+            tensor_np = frame.cpu().numpy()
+            if tensor_np.dtype == np.float32 or tensor_np.dtype == np.float64:
+                tensor_np = (np.clip(tensor_np, 0, 1) * 255).astype(np.uint8)
+            formatted_frames.append(tensor_np)
+        elif isinstance(frame, np.ndarray):
+            if frame.dtype == np.float32 or frame.dtype == np.float64:
+                frame = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
+            formatted_frames.append(frame)
         else:
-            formatted_frames.append(np.array(frame))
+            formatted_frames.append(np.array(frame, dtype=np.uint8))
 
     writer = imageio.get_writer(output_filename, fps=fps, codec='libx264', quality=8)
     for frame in formatted_frames:
@@ -398,6 +439,56 @@ async def image_generations(req: ImageGenerationRequest):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.post("/v1/images/edits")
+@app.post("/api/v1/images/edits")
+@app.post("/v1/images/harmonize")
+@app.post("/api/v1/images/harmonize")
+async def image_edits(
+    prompt: str = Form(...),
+    image: Optional[UploadFile] = File(None),
+    mask: Optional[UploadFile] = File(None),
+    model: Optional[str] = Form(None),
+    n: int = Form(1),
+    size: Optional[str] = Form("1024x1024"),
+    response_format: Optional[str] = Form("b64_json"),
+    guidance_scale: Optional[float] = Form(3.5),
+    num_inference_steps: Optional[int] = Form(20),
+    seed: Optional[int] = Form(None)
+):
+    width, height = parse_size(size, 1024, 1024)
+    init_img = None
+    if image is not None:
+        image_bytes = await image.read()
+        init_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        init_img = prepare_image(init_img, (width, height), "RGB")
+
+    pipe = await get_flux_pipeline()
+
+    kwargs = {
+        "prompt": prompt,
+        "width": width,
+        "height": height,
+        "num_inference_steps": int(num_inference_steps or 20),
+        "guidance_scale": float(guidance_scale if guidance_scale is not None else 3.5),
+        "generator": make_generator(seed),
+    }
+
+    if init_img is not None and "image" in inspect.signature(pipe.__call__).parameters:
+        kwargs["image"] = init_img
+
+    try:
+        result = await run_in_threadpool(run_pipeline_safely, pipe, kwargs)
+        clean_gpu()
+        return openai_image_response(result.images, response_format or "b64_json")
+    except torch.cuda.OutOfMemoryError:
+        clean_gpu()
+        raise HTTPException(status_code=507, detail="CUDA out of memory.")
+    except Exception as exc:
+        clean_gpu()
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @app.post("/v1/videos/generations")
 @app.post("/api/v1/videos/generations")
 async def video_generations(req: VideoGenerationRequest):
@@ -408,8 +499,8 @@ async def video_generations(req: VideoGenerationRequest):
         "prompt": req.prompt,
         "height": height,
         "width": width,
-        "num_frames": int(req.frames or 81),
-        "num_inference_steps": int(req.num_inference_steps or 30),
+        "num_frames": int(req.frames or 49),
+        "num_inference_steps": int(req.num_inference_steps or 20),
         "guidance_scale": float(req.guidance_scale if req.guidance_scale is not None else 6.0),
         "generator": make_generator(req.seed),
     }
@@ -434,95 +525,125 @@ async def video_generations(req: VideoGenerationRequest):
 async def chat_completions(req: ChatCompletionRequest):
     prompt, image_input = extract_prompt_and_image_from_chat(req.messages)
     model_lower = req.model.lower()
+    msg_id = f"chatcmpl-{uuid.uuid4()}"
 
-    try:
-        # Task 1: Video Generation (Wan2.2)
-        if "wan" in model_lower or "video" in model_lower or "ti2v" in model_lower:
-            if image_input:
-                if str(image_input).startswith("data:") or "base64" in str(image_input):
-                    pil_img = decode_base64_image(str(image_input))
-                else:
-                    pil_img = load_image(str(image_input)).convert("RGB")
-
-                width, height = parse_size("1280x704", 1280, 704)
-                pil_img = prepare_image(pil_img, (width, height), "RGB")
-
-                pipe = await get_wan_i2v_pipeline()
-                kwargs = {
-                    "prompt": prompt or "Animate this image",
-                    "image": pil_img,
-                    "height": height,
-                    "width": width,
-                    "num_frames": 81,
-                    "guidance_scale": 6.0,
-                    "num_inference_steps": 30,
-                }
-            else:
-                pipe = await get_wan_t2v_pipeline()
-                width, height = parse_size("1280x704", 1280, 704)
-                kwargs = {
-                    "prompt": prompt,
-                    "height": height,
-                    "width": width,
-                    "num_frames": 81,
-                    "guidance_scale": 6.0,
-                    "num_inference_steps": 30,
-                }
-
-            result = await run_in_threadpool(run_pipeline_safely, pipe, kwargs)
-            output_filename = await run_in_threadpool(process_video_export, result.frames[0], 24)
-            clean_gpu()
-
-            response_content = f"Here is your generated video:\n\n![Generated Video]({output_filename})"
-
-        # Task 2: Image Generation (FLUX.2)
-        else:
-            pipe = await get_flux_pipeline()
-            width, height = parse_size("1024x1024", 1024, 1024)
-            
-            kwargs = {
-                "prompt": prompt,
-                "width": width,
-                "height": height,
-                "num_inference_steps": 20,
-                "guidance_scale": 3.5,
-            }
-            result = await run_in_threadpool(run_pipeline_safely, pipe, kwargs)
-            
-            path = save_image(result.images[0])
-            clean_gpu()
-
-            response_content = f"Here is your generated image:\n\n![Generated Image]({path})"
-
-        return {
-            "id": f"chatcmpl-{uuid.uuid4()}",
-            "object": "chat.completion",
+    async def generate_chat_stream():
+        initial_chunk = {
+            "id": msg_id,
+            "object": "chat.completion.chunk",
             "created": int(time.time()),
             "model": req.model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": response_content,
-                    },
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": 10,
-                "completion_tokens": 20,
-                "total_tokens": 30,
-            },
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]
         }
-    except Exception as exc:
-        clean_gpu()
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(exc))
+        yield f"data: {json.dumps(initial_chunk)}\n\n"
+
+        try:
+            if "wan" in model_lower or "video" in model_lower or "ti2v" in model_lower:
+                if image_input:
+                    print("Detected Image-to-Video request! Loading template image...")
+                    pil_img = load_any_image(image_input)
+                    width, height = parse_size("1280x704", 1280, 704)
+                    pil_img = prepare_image(pil_img, (width, height), "RGB")
+
+                    pipe = await get_wan_i2v_pipeline()
+                    kwargs = {
+                        "prompt": prompt or "Animate this image",
+                        "image": pil_img,
+                        "height": height,
+                        "width": width,
+                        "num_frames": 49,
+                        "guidance_scale": 6.0,
+                        "num_inference_steps": 20,
+                    }
+                else:
+                    print("No image detected in payload. Defaulting to Text-to-Video pipeline...")
+                    pipe = await get_wan_t2v_pipeline()
+                    width, height = parse_size("1280x704", 1280, 704)
+                    kwargs = {
+                        "prompt": prompt,
+                        "height": height,
+                        "width": width,
+                        "num_frames": 49,
+                        "guidance_scale": 6.0,
+                        "num_inference_steps": 20,
+                    }
+
+                pipe_task = asyncio.create_task(run_in_threadpool(run_pipeline_safely, pipe, kwargs))
+
+                while not pipe_task.done():
+                    await asyncio.sleep(5)
+                    keep_alive_chunk = {
+                        "id": msg_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": req.model,
+                        "choices": [{"index": 0, "delta": {"content": " "}, "finish_reason": None}]
+                    }
+                    yield f"data: {json.dumps(keep_alive_chunk)}\n\n"
+
+                result = await pipe_task
+                output_filename = await run_in_threadpool(process_video_export, result.frames[0], 24)
+                clean_gpu()
+
+                response_text = f"\n\nHere is your generated video:\n\n![Generated Video]({output_filename})"
+
+            else:
+                pipe = await get_flux_pipeline()
+                width, height = parse_size("1024x1024", 1024, 1024)
+                kwargs = {
+                    "prompt": prompt,
+                    "width": width,
+                    "height": height,
+                    "num_inference_steps": 20,
+                    "guidance_scale": 3.5,
+                }
+
+                pipe_task = asyncio.create_task(run_in_threadpool(run_pipeline_safely, pipe, kwargs))
+                while not pipe_task.done():
+                    await asyncio.sleep(2)
+                    keep_alive_chunk = {
+                        "id": msg_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": req.model,
+                        "choices": [{"index": 0, "delta": {"content": " "}, "finish_reason": None}]
+                    }
+                    yield f"data: {json.dumps(keep_alive_chunk)}\n\n"
+
+                result = await pipe_task
+                path = save_image(result.images[0])
+                clean_gpu()
+
+                response_text = f"\n\nHere is your generated image:\n\n![Generated Image]({path})"
+
+            final_content_chunk = {
+                "id": msg_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": req.model,
+                "choices": [{"index": 0, "delta": {"content": response_text}, "finish_reason": "stop"}]
+            }
+            yield f"data: {json.dumps(final_content_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        except Exception as exc:
+            clean_gpu()
+            traceback.print_exc()
+            err_chunk = {
+                "id": msg_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": req.model,
+                "choices": [{"index": 0, "delta": {"content": f"\n\nError: {str(exc)}"}, "finish_reason": "stop"}]
+            }
+            yield f"data: {json.dumps(err_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(generate_chat_stream(), media_type="text/event-stream")
 
 
 if __name__ == "__main__":
     print("Starting Unified Image & Video API Backend...")
     print(f"Device: {DEVICE}, Precision: {DTYPE}")
     import uvicorn
-    uvicorn.run(app, host=HOST, port=PORT, timeout_keep_alive=600)
+    uvicorn.run(app, host=HOST, port=PORT, timeout_keep_alive=1200)

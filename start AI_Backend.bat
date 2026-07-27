@@ -23,7 +23,8 @@ echo =====================================
 
 cd /d C:\Users\%username%\odysseus\sd_server_dir
 
-python sd_server.py
+REM python sd_server.py
+python unified_ai_studio.py
 
 echo.
 echo Server stopped.

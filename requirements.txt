@@ -1,0 +1,27 @@
+# Web Server & Framework
+fastapi>=0.100.0
+uvicorn>=0.22.0
+pydantic>=2.0.0
+
+# PyTorch Deep Learning Ecosystem
+torch
+torchvision
+
+# Hugging Face & Diffusion Models
+diffusers>=0.30.0
+transformers>=4.40.0
+accelerate>=0.28.0
+huggingface-hub>=0.20.0
+sentencepiece
+protobuf
+
+# Image & Video Processing
+Pillow>=10.0.0
+numpy
+imageio>=2.30.0
+imageio-ffmpeg>=0.4.8
+opencv-python
+
+# Utilities
+anyio
+asyncio

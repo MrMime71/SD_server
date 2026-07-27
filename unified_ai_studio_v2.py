@@ -271,6 +271,20 @@ async def get_pipeline(pipeline_type: str):
 # ============================================================================
 # Core API Routes
 # ============================================================================
+@app.get("/v1/models")
+@app.get("/api/v1/models")
+async def list_models():
+    return {
+        "object": "list",
+        "data": [
+            {"id": "black-forest-labs/FLUX.2-klein-4B", "object": "model", "owned_by": "local"},
+            {"id": "FLUX.2-klein-4B", "object": "model", "owned_by": "local"},
+            {"id": "black-forest-labs/FLUX.1-Fill-dev", "object": "model", "owned_by": "local"},
+            {"id": "Wan-AI/Wan2.2-TI2V-5B-Diffusers", "object": "model", "owned_by": "local"},
+            {"id": "Wan2.2-TI2V-5B-Diffusers", "object": "model", "owned_by": "local"},
+            {"id": "Wan2.2-TI2V-5B", "object": "model", "owned_by": "local"},
+        ]
+    }
 
 @app.get("/")
 async def health_check():
